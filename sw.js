@@ -1,9 +1,10 @@
-const CACHE_NAME = 'gameon-v7';
+const CACHE_NAME = 'gameon-v8';
 const ASSETS = [
   './',
   './index.html',
   './manifest.json',
   './icon.png',
+  './icon.jpg',
   './icon-180.png',
   './icon-192.png',
   './icon-512.png',

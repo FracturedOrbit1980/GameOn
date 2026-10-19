@@ -1,12 +1,15 @@
-import os
+import base64
+from pathlib import Path
 
-with open('index.html', 'r', encoding='utf-8') as f:
+ROOT = Path(__file__).resolve().parent
+
+with (ROOT / 'index.html').open('r', encoding='utf-8') as f:
     html = f.read()
 
-with open('tailwind.min.css', 'r', encoding='utf-8') as f:
+with (ROOT / 'tailwind.min.css').open('r', encoding='utf-8') as f:
     tw_css = f.read()
 
-with open('html2pdf.bundle.min.js', 'r', encoding='utf-8') as f:
+with (ROOT / 'html2pdf.bundle.min.js').open('r', encoding='utf-8') as f:
     pdf_js = f.read()
 
 # Replace Tailwind stylesheet link with inlined style
@@ -32,7 +35,11 @@ if target_pdf in html:
 else:
     html = html.replace('<script src="./html2pdf.bundle.min.js"></script>', inline_pdf)
 
-with open('gameon.html', 'w', encoding='utf-8') as f:
+# The legacy PDF ledger references this image directly (the app icons are embedded).
+icon = base64.b64encode((ROOT / 'icon.jpg').read_bytes()).decode('ascii')
+html = html.replace('src="./icon.jpg"', f'src="data:image/jpeg;base64,{icon}"')
+
+with (ROOT / 'gameon.html').open('w', encoding='utf-8') as f:
     f.write(html)
 
 print("Created 100% self-contained gameon.html. Total size:", len(html))

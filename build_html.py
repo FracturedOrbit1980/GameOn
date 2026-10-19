@@ -1,5 +1,8 @@
 import os
 
+# Historical scaffold only. It predates the maintained app and would overwrite fixes.
+raise SystemExit('index.html is the maintained source. Use python bundle_offline.py to build gameon.html; do not regenerate index.html from this legacy scaffold.')
+
 with open('icon_b64.txt', 'r', encoding='utf-8') as f:
     icon_b64 = f.read().strip()
 

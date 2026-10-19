@@ -67,7 +67,7 @@ Accessible via the **"Create PDF report"** button on the Stats screen and on eac
 ### 7. 💾 100% Offline & Reliable Data Persistence
 - **Persistent Storage:** All data automatically persists in `localStorage` after every change.
 - **Interruption Resilience:** Survives app closing, refreshing, switching tabs, or phone reboots.
-- **Service Worker (`sw.js` v7):** Pre-caches `tailwind.min.css`, `html2pdf.bundle.min.js`, and all assets for offline loading anywhere on the pitch.
+- **Service Worker (`sw.js` v8):** Pre-caches `tailwind.min.css`, `html2pdf.bundle.min.js`, and report icons for offline loading anywhere on the pitch.
 - **Backup & Restore:** Full JSON export and import in settings.
 
 ---
@@ -96,6 +96,8 @@ npm run build:css
 ```
 
 ### Option D: Self-Contained Bundle
+`index.html` is the maintained application source. `bundle_offline.py` combines it with local CSS, the PDF library and the ledger icon to produce `gameon.html`. Commit both HTML files when changing the app. `build_html.py` is a historical scaffold and is disabled because it would overwrite the maintained source with an older app.
+
 To generate the 100% self-contained single-file HTML bundle:
 ```bash
 python bundle_offline.py
@@ -106,10 +108,20 @@ This updates `gameon.html`, which can be opened directly from disk in any web br
 
 ## 🧪 Testing
 
-Run the automated test suite covering all 20 specification requirements:
+Install development dependencies and run the application logic and timer regressions:
 ```bash
-node test_app.js
+npm install
+npm test
 ```
+
+After application edits, run `npm run bundle` before testing. The suite checks that the standalone app logic matches `index.html`. For real Chromium export, reload and offline regressions:
+
+```bash
+npx playwright install chromium
+npm run test:browser
+```
+
+Browser tests write PDFs to `output/playwright/` for visual review. They use a temporary local HTTP server and synthetic fixtures, never your live match data. See [focused verification and phone checklist](TESTING.md) for reproduction evidence and remaining device checks.
 
 ---
 
@@ -130,5 +142,5 @@ node test_app.js
    - [ ] Generate a Single Match PDF: verify file name `GameOn_<Team>_<Opponent>_<Date>.pdf` and check player table (pitch minutes, bench minutes, goals, assists, subs).
    - [ ] Generate a Date Range PDF: test quick presets (Last 7d, This Month, Season, All Time), verify overall record (W/D/L), match list, and player totals sorted by minutes played with highlights for top scorer, top assists, and most minutes.
 4. **Offline & Nav:**
-   - [ ] Turn on Airplane Mode: verify app reloads and operates completely offline from service worker cache (`gameon-v7`).
+   - [ ] Turn on Airplane Mode: verify app reloads and operates completely offline from service worker cache (`gameon-v8`).
    - [ ] Verify the bottom navigation dock is always tappable with comfortable padding.
