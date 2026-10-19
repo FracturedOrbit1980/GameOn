@@ -44,13 +44,16 @@ assert(html.includes('<link rel="stylesheet" href="./tailwind.min.css" />'), 'in
 assert(!html.includes('src="https://cdn.tailwindcss.com"'), 'Found unwanted Tailwind CDN script in index.html');
 
 const sw = fs.readFileSync('sw.js', 'utf-8');
-assert(sw.includes("CACHE_NAME = 'gameon-v7'"), 'sw.js cache version is not gameon-v7');
+assert(sw.includes("CACHE_NAME = 'gameon-v8'"), 'sw.js cache version is not gameon-v8');
+assert(sw.includes("'./icon.jpg'"), 'PDF ledger icon must be available offline');
 assert(sw.includes("'./tailwind.min.css'"), 'sw.js missing tailwind.min.css in cached assets');
-console.log('✓ Standalone offline Tailwind CSS & sw.js gameon-v7 cache verified');
+console.log('✓ Standalone offline Tailwind CSS & sw.js gameon-v8 cache verified');
 
 // 6. Test JS logic execution
 const scripts = html.match(/<script>([\s\S]*?)<\/script>/g);
 const mainScriptTag = scripts[scripts.length - 1];
+const bundledScripts = fs.readFileSync('gameon.html', 'utf-8').match(/<script>([\s\S]*?)<\/script>/g);
+assert.strictEqual(bundledScripts[bundledScripts.length - 1], mainScriptTag, 'Run npm run bundle: standalone app logic is stale');
 let jsCode = mainScriptTag.replace(/^<script>/, '').replace(/<\/script>$/, '');
 jsCode = jsCode.replace('const AppState =', 'global.AppState =').replace('const App =', 'global.App =');
 
@@ -362,8 +365,9 @@ App.generateDateRangePdf('2025-01-01', '2025-01-02');
 assert(toastMsg.includes('No matches found'), 'Empty date range must show friendly message');
 
 // Valid range test
+let pdfContainer;
+App.exportPdf = (report) => { pdfContainer = report; };
 App.generateDateRangePdf('2026-10-01', '2026-10-20');
-const pdfContainer = dom['pdfExportContainer'];
 assert(pdfContainer.innerHTML.includes('Squad Performance Ledger'), 'PDF ledger title missing');
 assert(pdfContainer.innerHTML.includes('1W • 1D • 0L') || pdfContainer.innerHTML.includes('1W &bull; 1D &bull; 0L'), 'Record summary should reflect 1W - 1D - 0L');
 assert(pdfContainer.innerHTML.includes('Top Scorer'), 'Top scorer highlight badge missing');
@@ -392,6 +396,110 @@ assert.strictEqual(typeof App.openEditGameMinutesModal, 'undefined', 'openEditGa
 assert.strictEqual(typeof App.saveGameMinutes, 'undefined', 'saveGameMinutes must not be defined');
 console.log('✓ Tamper-proof read-only playing time reporting & game detail breakdown verified');
 
-console.log('\n=========================================');
-console.log('ALL 20 AUTOMATED TESTS PASSED WITH 100% SUCCESS!');
-console.log('=========================================');
+// Regression: simulate delayed callbacks and reloads without sleeping.
+const realNow = Date.now;
+const realSetInterval = global.setInterval;
+const realClearInterval = global.clearInterval;
+let now = 1800000000000;
+let tick;
+Date.now = () => now;
+global.setInterval = fn => { tick = fn; return 1; };
+global.clearInterval = () => { tick = null; };
+try {
+  AppState.clock = {seconds: 0, period: '1st Half', running: false, startedAt: null};
+  AppState.playerTimers = {};
+  AppState.match.starters = [p1.id];
+  AppState.match.bench = [p2.id];
+  App.toggleTimer();
+  assert(JSON.parse(storage.gameon_clock).running, 'Start must persist immediately');
+  now += 61250; // Only one callback after a throttled/background interval.
+  tick();
+  assert.strictEqual(AppState.clock.seconds, 61.25);
+  assert.strictEqual(AppState.playerTimers[p1.id], 61.25);
+  assert.strictEqual(App.formatTime(AppState.clock.seconds), '01:01');
+  now += 750;
+  App.selectSubOut(p1.id);
+  App.selectSubIn(p2.id);
+  assert.strictEqual(AppState.playerTimers[p1.id], 62);
+  assert.strictEqual(AppState.events[0].matchTimeSeconds, 62);
+  assert.strictEqual(AppState.events[0].playerOutId, p1.id);
+  assert(App.isPlayerSub(AppState.events[0], p1, 'Out'));
+  assert(App.isPlayerSub({type:'Sub', playerIn:p2.name, playerInNum:p2.number}, p2, 'In'), 'Old substitutions must still count');
+  assert(!App.isPlayerSub({type:'Sub', playerIn:p2.name, playerInNum:99}, p2, 'In'));
+  now += 10500;
+  App.toggleTimer();
+  assert.strictEqual(AppState.clock.seconds, 72.5);
+  assert.strictEqual(AppState.playerTimers[p2.id], 10.5);
+  assert.strictEqual(JSON.parse(storage.gameon_clock).running, false);
+  now += 60000;
+  App.syncClock();
+  assert.strictEqual(AppState.clock.seconds, 72.5, 'Paused time must not accrue');
+  App.toggleTimer();
+  now += 500;
+  App.setPeriod('2nd Half');
+  assert.strictEqual(AppState.clock.seconds, 73);
+  assert.strictEqual(JSON.parse(storage.gameon_clock).period, '2nd Half');
+  const historyBefore = JSON.stringify(AppState.matchHistory);
+  App.saveStorage();
+  now += 90000;
+  App.loadStorage();
+  assert.strictEqual(AppState.clock.seconds, 163, 'Reload must catch up running time');
+  assert.strictEqual(AppState.playerTimers[p2.id], 101);
+  assert.strictEqual(AppState.clock.running, true);
+  assert.strictEqual(JSON.stringify(AppState.matchHistory), historyBefore, 'Migration must preserve history');
+  now += 250;
+  App.endMatch();
+  assert.strictEqual(AppState.matchHistory[0].durationSeconds, 163.25);
+  assert.strictEqual(AppState.matchHistory[0].playerTimers[p2.id], 101.25);
+  assert.strictEqual(AppState.clock.seconds, 0);
+  assert.strictEqual(AppState.clock.startedAt, null);
+  App.toggleTimer();
+  now += 1500;
+  App.resetTimer();
+  assert.strictEqual(JSON.parse(storage.gameon_clock).seconds, 0);
+  assert.strictEqual(JSON.parse(storage.gameon_clock).running, false);
+  // Stopwatch reset has always preserved accrued player time.
+  assert.strictEqual(AppState.playerTimers[p2.id], 1.5);
+  App.restoreClock({seconds: 42, period: '2nd Half', savedAt: now - 60000});
+  assert.strictEqual(AppState.clock.seconds, 42);
+  assert.strictEqual(AppState.clock.running, false, 'Old saves must migrate paused');
+  for (const startedAt of [null, -1, 0, '1800000000000', NaN, Infinity, now + 1]) {
+    App.restoreClock({version: 2, seconds: 42, running: true, startedAt});
+    assert.strictEqual(AppState.clock.seconds, 42);
+    assert.strictEqual(AppState.clock.running, false, `Invalid timestamp: ${startedAt}`);
+  }
+  App.toggleTimer();
+  now -= 1000;
+  App.syncClock();
+  assert.strictEqual(AppState.clock.running, false, 'Backward clock changes must not subtract time');
+  AppState.clock.seconds = 0;
+  AppState.playerTimers = {};
+  App.toggleTimer();
+  for (const elapsed of [700,100,200]) { now += elapsed; App.syncClock(); }
+  assert.strictEqual(AppState.clock.seconds, 1, 'Subsecond checkpoints must not accumulate rounding drift');
+  assert.strictEqual(AppState.playerTimers[p2.id], 1);
+  const restoredHistory = JSON.parse(JSON.stringify(AppState.matchHistory));
+  global.FileReader = class {
+    readAsText() {
+      this.onload({target:{result:JSON.stringify({
+        squad:AppState.squad, match:AppState.match, matchHistory:restoredHistory,
+        clock:{seconds:99,period:'2nd Half'}, playerTimers:{[p2.id]:20}
+      })}});
+    }
+  };
+  App.importBackup({target:{files:[{}],value:'backup.json'}});
+  now += 60000;
+  App.syncClock();
+  assert.strictEqual(AppState.clock.running, false, 'Import must stop the previous live session');
+  assert.strictEqual(AppState.clock.seconds, 99);
+  assert.strictEqual(AppState.playerTimers[p2.id], 20);
+  assert.deepStrictEqual(AppState.matchHistory, restoredHistory);
+  delete global.FileReader;
+  console.log('✓ Timestamp timers: throttling, pause/resume, substitutions, periods, reload, end/reset, legacy data and invalid timestamps');
+} finally {
+  App.stopClock();
+  Date.now = realNow;
+  global.setInterval = realSetInterval;
+  global.clearInterval = realClearInterval;
+}
+console.log('\nAll application and timer regression tests passed.');

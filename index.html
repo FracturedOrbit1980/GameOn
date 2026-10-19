@@ -934,6 +934,7 @@
         period: '1st Half',
         seconds: 0,
         running: false,
+        startedAt: null, // Timestamp of the last settled elapsed-time checkpoint.
         intervalId: null
       },
 
@@ -1255,8 +1256,10 @@
 
         // Auto-save on page minimize, tab change or closing
         window.addEventListener('beforeunload', () => App.saveStorage());
+        window.addEventListener('pagehide', () => App.saveStorage());
         document.addEventListener('visibilitychange', () => {
-          if (document.visibilityState === 'hidden') App.saveStorage();
+          App.saveStorage();
+          App.updateClockDisplay();
         });
       },
 
@@ -1548,6 +1551,8 @@
         const team = AppState.teams.find(t => t.id === teamId);
         if (!team) return;
 
+        this.stopClock();
+
         AppState.currentTeamId = team.id;
         AppState.currentTeamName = team.name;
         AppState.squad = JSON.parse(JSON.stringify(team.squad || []));
@@ -1628,10 +1633,7 @@
 
           const sC = localStorage.getItem('gameon_clock');
           if (sC) {
-            const sc = JSON.parse(sC);
-            AppState.clock.seconds = sc.seconds || 0;
-            AppState.clock.period = sc.period || '1st Half';
-            AppState.clock.running = false; // Always load paused so coach controls kickoff
+            this.restoreClock(JSON.parse(sC));
           }
 
           const sK = localStorage.getItem('gameon_kit');
@@ -1673,6 +1675,7 @@
       },
 
       saveStorage() {
+        this.syncClock();
         try {
           localStorage.setItem('gameon_squad', JSON.stringify(AppState.squad));
           localStorage.setItem('gameon_match', JSON.stringify(AppState.match));
@@ -1682,8 +1685,12 @@
           localStorage.setItem('gameon_clock', JSON.stringify({
             seconds: AppState.clock.seconds,
             period: AppState.clock.period,
+            version: 2,
+            running: AppState.clock.running,
+            startedAt: AppState.clock.startedAt,
             savedAt: Date.now()
           }));
+          this.lastClockSaveAt = Date.now();
           localStorage.setItem('gameon_kit', AppState.kitColor);
           localStorage.setItem('gameon_theme', AppState.theme);
           if (AppState.themeStyle) localStorage.setItem('gameon_theme_style', AppState.themeStyle);
@@ -1841,6 +1848,7 @@
       },
 
       applyFormatDefaults() {
+        this.syncClock();
         const fmt = AppState.match.format;
         const quota = parseInt(fmt);
         document.getElementById('activeMatchFormatBadge').innerText = `${fmt}v${fmt}`;
@@ -1854,7 +1862,7 @@
           }
         });
 
-        if (AppState.match.starters.length === 0) {
+        if (AppState.match.starters.length === 0 && !AppState.clock.running) {
           const avail = AppState.squad.filter(p => AppState.match.availability[p.id]);
           // Sort available players by designated pitch position (GK -> DEF -> MID -> FWD)
           avail.sort((a, b) => this.getPositionRank(a.position) - this.getPositionRank(b.position));
@@ -2328,6 +2336,7 @@
       },
 
       toggleAvailability(pid) {
+        this.syncClock();
         AppState.match.availability[pid] = !AppState.match.availability[pid];
         if (!AppState.match.availability[pid]) {
           AppState.match.starters = AppState.match.starters.filter(id => id !== pid);
@@ -2343,6 +2352,7 @@
       },
 
       setAllAvailability(status) {
+        this.syncClock();
         AppState.squad.forEach(p => {
           AppState.match.availability[p.id] = status;
         });
@@ -2361,6 +2371,7 @@
       },
 
       deletePlayer(pid) {
+        this.syncClock();
         AppState.squad = AppState.squad.filter(p => p.id !== pid);
         AppState.match.starters = AppState.match.starters.filter(id => id !== pid);
         AppState.match.bench = AppState.match.bench.filter(id => id !== pid);
@@ -2370,47 +2381,101 @@
         this.toast('Player removed from registry');
       },
 
+      // Settle wall-clock time before reading totals or changing the on-pitch lineup.
+      // Keep fractional seconds so frequent saves/substitutions do not lose time.
+      syncClock(now = Date.now()) {
+        const clock = AppState.clock;
+        if (!clock.running) return;
+        if (!Number.isSafeInteger(clock.startedAt) || clock.startedAt <= 0 || clock.startedAt > now) {
+          clock.running = false;
+          clock.startedAt = null;
+          clearInterval(clock.intervalId);
+          return;
+        }
+        const elapsedMs = now - clock.startedAt;
+        clock.seconds = (Math.round(clock.seconds * 1000) + elapsedMs) / 1000;
+        [...new Set(AppState.match.starters)].forEach(pid => {
+          AppState.playerTimers[pid] = (Math.round((AppState.playerTimers[pid] || 0) * 1000) + elapsedMs) / 1000;
+        });
+        clock.startedAt = now;
+      },
+
+      stopClock() {
+        this.syncClock();
+        clearInterval(AppState.clock.intervalId);
+        AppState.clock.intervalId = null;
+        AppState.clock.running = false;
+        AppState.clock.startedAt = null;
+      },
+
+      startClockInterval() {
+        clearInterval(AppState.clock.intervalId);
+        AppState.clock.intervalId = setInterval(() => {
+          App.syncClock();
+          App.updateClockDisplay();
+          if (Date.now() - (App.lastClockSaveAt || 0) >= 5000) App.saveStorage();
+        }, 1000);
+      },
+
+      restoreClock(saved) {
+        clearInterval(AppState.clock.intervalId);
+        AppState.clock.intervalId = null;
+        saved = saved && typeof saved === 'object' ? saved : {};
+        const clock = AppState.clock;
+        clock.seconds = Number.isFinite(saved.seconds) && saved.seconds >= 0 ? saved.seconds : 0;
+        clock.period = saved.period || '1st Half';
+        // Older data never recorded running state: retain its paused behavior.
+        clock.running = saved.version === 2 && saved.running === true;
+        clock.startedAt = saved.startedAt;
+        this.syncClock(); // Reject corrupt/future timestamps without inflating totals.
+        if (clock.running) this.startClockInterval();
+        else clock.startedAt = null;
+      },
+
+      renderClockState() {
+        const running = AppState.clock.running;
+        const button = document.getElementById('clockToggleBtn');
+        const status = document.getElementById('clockStatusSubtext');
+        button.innerText = running ? 'PAUSE ⏸' : (AppState.clock.seconds ? 'RESUME ▶' : 'START ▶');
+        button.className = 'flex-1 max-w-[140px] py-2.5 rounded-2xl text-obsidian-950 font-black text-sm tracking-wide shadow-lg active:scale-95 transition ' +
+          (running ? 'bg-amber-500' : 'bg-gradient-to-r from-cyber-cyan to-cyber-mint');
+        status.innerText = running ? '● Live Match In Progress — Accumulating Playing Seconds' : 'Clock Paused';
+        status.className = 'text-xs font-medium mt-1 ' + (running ? 'text-cyber-mint glow-pulse' : 'text-amber-400');
+      },
+
       toggleTimer() {
         if (AppState.clock.running) {
-          clearInterval(AppState.clock.intervalId);
-          AppState.clock.running = false;
-          document.getElementById('clockToggleBtn').innerText = 'RESUME ▶';
-          document.getElementById('clockToggleBtn').className = 'flex-1 max-w-[140px] py-2.5 rounded-2xl bg-gradient-to-r from-cyber-cyan to-cyber-mint text-obsidian-950 font-black text-sm tracking-wide shadow-lg active:scale-95 transition';
-          document.getElementById('clockStatusSubtext').innerText = 'Clock Paused';
-          document.getElementById('clockStatusSubtext').className = 'text-xs text-amber-400 font-medium mt-1';
+          this.stopClock();
         } else {
           AppState.clock.running = true;
-          AppState.clock.intervalId = setInterval(() => {
-            AppState.clock.seconds++;
-            
-            AppState.match.starters.forEach(pid => {
-              AppState.playerTimers[pid] = (AppState.playerTimers[pid] || 0) + 1;
-            });
-
-            App.updateClockDisplay();
-            if (AppState.clock.seconds % 5 === 0) App.saveStorage();
-          }, 1000);
-
-          document.getElementById('clockToggleBtn').innerText = 'PAUSE ⏸';
-          document.getElementById('clockToggleBtn').className = 'flex-1 max-w-[140px] py-2.5 rounded-2xl bg-amber-500 text-obsidian-950 font-black text-sm tracking-wide shadow-lg active:scale-95 transition';
-          document.getElementById('clockStatusSubtext').innerText = '● Live Match In Progress — Accumulating Playing Seconds';
-          document.getElementById('clockStatusSubtext').className = 'text-xs text-cyber-mint font-medium mt-1 glow-pulse';
+          AppState.clock.startedAt = Date.now();
+          this.startClockInterval();
         }
+        this.saveStorage();
+        this.updateClockDisplay();
       },
 
       resetTimer() {
-        clearInterval(AppState.clock.intervalId);
-        AppState.clock.running = false;
+        this.stopClock();
         AppState.clock.seconds = 0;
         this.updateClockDisplay();
         document.getElementById('clockToggleBtn').innerText = 'START ▶';
         document.getElementById('clockStatusSubtext').innerText = 'Clock Reset — Ready to Kickoff';
         document.getElementById('clockStatusSubtext').className = 'text-xs text-cyber-cyan font-medium mt-1';
         this.toast('Stopwatch reset to 00:00');
+        this.saveStorage();
       },
 
       setPeriod(period) {
+        this.syncClock();
         AppState.clock.period = period;
+        this.renderPeriodDisplay();
+        this.toast('Period set to ' + period);
+        this.saveStorage();
+      },
+
+      renderPeriodDisplay() {
+        const period = AppState.clock.period;
         const b1 = document.getElementById('periodBtn_1');
         const b2 = document.getElementById('periodBtn_2');
         if (period === '1st Half') {
@@ -2420,10 +2485,10 @@
           b2.className = 'px-2.5 py-1 rounded-lg font-bold bg-cyber-cyan text-obsidian-950';
           b1.className = 'px-2.5 py-1 rounded-lg text-slate-400 font-semibold hover:text-white';
         }
-        this.toast('Period set to ' + period);
       },
 
       updateClockDisplay() {
+        this.renderClockState();
         document.getElementById('matchClockDisplay').innerText = this.formatTime(AppState.clock.seconds);
         AppState.match.starters.forEach(pid => {
           const el = document.getElementById('liveTimer_' + pid);
@@ -2432,6 +2497,7 @@
       },
 
       formatTime(sec) {
+        sec = Math.floor(sec);
         const m = Math.floor(sec / 60);
         const s = sec % 60;
         return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
@@ -2527,6 +2593,7 @@
       },
 
       selectSubIn(benchPid) {
+        this.syncClock();
         if (!AppState.subOutPlayerId) {
           this.toast('Tap a field player first to substitute out');
           return;
@@ -2547,8 +2614,10 @@
           matchId: AppState.match.id,
           type: 'Sub',
           playerOut: outPlayer.name,
+          playerOutId: outPid,
           playerOutNum: outPlayer.number,
           playerIn: inPlayer.name,
+          playerInId: benchPid,
           playerInNum: inPlayer.number,
           matchTimeSeconds: AppState.clock.seconds,
           period: AppState.clock.period,
@@ -2610,6 +2679,7 @@
       },
 
       confirmEvent() {
+        this.syncClock();
         const type = AppState.currentEventType;
         const selector = document.getElementById('eventPlayerSelector');
         const pid = selector.value;
@@ -2704,11 +2774,7 @@
           return;
         }
 
-        // Pause active timer if running
-        if (AppState.clock.running) {
-          clearInterval(AppState.clock.intervalId);
-          AppState.clock.running = false;
-        }
+        this.stopClock();
 
         // Create completed match archive
         const currentFormation = AppState.match.formation || (document.getElementById('formationSelect') ? document.getElementById('formationSelect').value : '') || '2-3-1';
@@ -2782,6 +2848,7 @@
 
       // Requirement 5: Export full backup to JSON file
       exportBackup() {
+        this.syncClock();
         const backupData = {
           appName: 'GameOn',
           exportVersion: 2,
@@ -2836,6 +2903,8 @@
               event.target.value = '';
               return;
             }
+
+            this.stopClock(); // A restored backup is a paused snapshot, not a live session.
 
             if (data.squad) AppState.squad = data.squad;
             if (data.match) AppState.match = data.match;
@@ -2981,6 +3050,7 @@
 
 
       renderStats() {
+        this.syncClock();
         const container = document.getElementById('statsCardsContainer');
         container.innerHTML = '';
 
@@ -3338,8 +3408,117 @@
 
 
       // --- DUAL-MODE PDF REPORT GENERATION (Single Match & Date Range) ---
+      isPlayerSub(event, player, direction) {
+        if (event.type !== 'Sub') return false;
+        const id = event[`player${direction}Id`];
+        if (id) return id === player.id;
+        // Older saved substitutions recorded names/numbers but no player IDs.
+        return event[`player${direction}`] === player.name && Number(event[`player${direction}Num`]) === Number(player.number);
+      },
+
+      async exportPdf(report, filename) {
+        if (this.pdfExportBusy) {
+          this.toast('A PDF is already being generated. Please wait.');
+          return false;
+        }
+        if (typeof html2pdf === 'undefined') {
+          this.toast('PDF library unavailable. Reload the app and try again.', '⚠️');
+          return false;
+        }
+        this.pdfExportBusy = true;
+        this.toast('Generating PDF document...');
+        const stage = document.createElement('div');
+        // A4 minus 8 mm margins. Render one page at a time: a full report canvas
+        // can exceed browser canvas limits even when the resulting PDF is small.
+        const width = 194 * 96 / 25.4;
+        const pageHeight = Math.floor(275 * 96 / 25.4); // Reserve space for page numbers.
+        stage.style.cssText = `position:fixed;left:0;top:0;width:${width}px;z-index:-100;pointer-events:none;background:white;color:#0f172a;`;
+        report.style.width = `${width}px`;
+        report.style.boxSizing = 'border-box';
+        stage.appendChild(report);
+        document.body.appendChild(stage);
+        let worker;
+        try {
+          // The canvas renderer clones the document into an iframe. That clone
+          // cannot rely on a service worker to reload external CSS while offline.
+          const exportStyles = Array.from(document.styleSheets).map(sheet => {
+            try { return Array.from(sheet.cssRules).map(rule => rule.cssText).join('\n'); }
+            catch (_) { return ''; }
+          }).join('\n');
+          if (document.fonts) await document.fonts.ready;
+          await Promise.all(Array.from(report.querySelectorAll('img')).map(img => img.decode().catch(() => {})));
+          const height = Math.ceil(report.getBoundingClientRect().height);
+          const top = report.getBoundingClientRect().top;
+          const rows = Array.from(report.querySelectorAll('tr, [data-pdf-event], #pdfTimelineLog > div')).map(row => {
+            const rect = row.getBoundingClientRect();
+            return { top: rect.top - top, bottom: rect.bottom - top };
+          });
+          const pages = [];
+          for (let start = 0; start < height;) {
+            let end = Math.min(start + pageHeight, height);
+            const crossing = rows.find(row => row.top < end && row.bottom > end && row.top > start + 1);
+            if (crossing) end = Math.floor(crossing.top);
+            pages.push({ start, end });
+            start = end;
+          }
+          let pdf;
+          for (const [index, bounds] of pages.entries()) {
+            const frame = document.createElement('div');
+            frame.style.cssText = `position:relative;width:${width}px;height:${pageHeight}px;background:white;overflow:hidden;`;
+            const clip = document.createElement('div');
+            clip.style.cssText = `position:relative;overflow:hidden;height:${bounds.end - bounds.start}px;`;
+            const content = report.cloneNode(true);
+            content.style.position = 'absolute';
+            content.style.top = `${-bounds.start}px`;
+            content.style.left = '0';
+            clip.appendChild(content);
+            frame.appendChild(clip);
+            stage.appendChild(frame);
+            worker = html2pdf().set({
+              margin: 8,
+              image: { type: 'jpeg', quality: 0.98 },
+              html2canvas: {
+                scale: 2, scrollX: 0, scrollY: 0, logging: false, backgroundColor: '#ffffff',
+                onclone(clonedDocument) {
+                  const style = clonedDocument.createElement('style');
+                  style.textContent = exportStyles;
+                  clonedDocument.head.appendChild(style);
+                }
+              },
+              jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+              pagebreak: { mode: [] }
+            }).from(frame).toCanvas();
+            const canvas = await worker.get('canvas');
+            if (!canvas.width || !canvas.height) throw new Error('PDF page could not be rendered');
+            if (!pdf) pdf = await worker.toPdf().get('pdf');
+            else {
+              pdf.addPage();
+              pdf.addImage(canvas.toDataURL('image/jpeg', 0.98), 'JPEG', 8, 8, 194, canvas.height * 194 / canvas.width);
+            }
+            pdf.setFontSize(8);
+            pdf.setTextColor(100, 116, 139);
+            pdf.text(`Page ${index + 1} of ${pages.length}`, 202, 291, { align: 'right' });
+            canvas.width = canvas.height = 0;
+            frame.remove();
+          }
+          await pdf.save(filename, { returnPromise: true });
+          this.toast('PDF exported. Check your downloads. 📄');
+          return true;
+        } catch (err) {
+          console.error('PDF error:', err);
+          this.toast('PDF export failed. Please try again with fewer matches.', '⚠️');
+          return false;
+        } finally {
+          // html2pdf normally removes its overlay after rendering; rejection can
+          // leave it mounted. Only remove the overlay belonging to this export.
+          if (worker && worker.prop && worker.prop.overlay) worker.prop.overlay.remove();
+          stage.remove();
+          this.pdfExportBusy = false;
+        }
+      },
+
       formatPdfDuration(seconds) {
-        const s = Math.max(0, Math.round(seconds || 0));
+        const s = Math.max(0, Math.floor(seconds || 0));
         if (s >= 3600) {
           const hrs = Math.floor(s / 3600);
           const mins = Math.floor((s % 3600) / 60);
@@ -3553,6 +3732,7 @@
       },
 
       generateSingleMatchPdf(matchId = null) {
+        this.syncClock();
         if (!matchId) {
           const select = document.getElementById('pdfSelectMatch');
           matchId = select ? select.value : null;
@@ -3583,8 +3763,7 @@
         const events = isLive ? AppState.events : (target.events || []);
         const starters = isLive ? AppState.match.starters : (target.starters || []);
 
-        const container = document.getElementById('pdfExportContainer');
-        if (!container) return;
+        const container = document.createElement('div');
 
         let tableRowsHtml = '';
         AppState.squad.forEach(p => {
@@ -3592,8 +3771,8 @@
           const benchSec = Math.max(0, durationSec - pitchSec);
           const goals = events.filter(e => e.type === 'Goal' && e.playerId === p.id).length;
           const assists = events.filter(e => e.type === 'Assist' && e.playerId === p.id).length;
-          const subsIn = events.filter(e => e.type === 'Sub' && e.playerInId === p.id).length;
-          const subsOut = events.filter(e => e.type === 'Sub' && e.playerOutId === p.id).length;
+          const subsIn = events.filter(e => this.isPlayerSub(e, p, 'In')).length;
+          const subsOut = events.filter(e => this.isPlayerSub(e, p, 'Out')).length;
           const isStarter = starters.includes(p.id);
 
           tableRowsHtml += `
@@ -3625,7 +3804,7 @@
             else { label = `${ev.type} - ${ev.playerName || ''}`; }
 
             timelineHtml += `
-              <div style="padding: 4px 0; display: flex; align-items: center; color: #334155; font-size: 11px;">
+              <div data-pdf-event style="padding: 4px 0; display: flex; align-items: center; color: #334155; font-size: 11px;">
                 <span style="font-family: monospace; font-weight: bold; color: #059669; min-width: 50px;">[${this.formatPdfDuration(ev.matchTimeSeconds)}]</span>
                 <span style="margin: 0 6px;">${icon}</span>
                 <span>${label}</span>
@@ -3700,39 +3879,17 @@
             <!-- FOOTER -->
             <div style="border-top: 1px solid #e2e8f0; padding-top: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: #94a3b8;">
               <div>Made with GameOn &bull; Tactical Pitch, Live Rotations & Match Intelligence</div>
-              <div>Page 1 of 1 &bull; ${date}</div>
+              <div>${date}</div>
             </div>
           </div>
         `;
 
         this.closeModals();
-        container.classList.remove('hidden');
-
         const safeTeam = String(teamName).replace(/[^a-zA-Z0-9_-]/g, '_');
         const safeOpp = String(opponent).replace(/[^a-zA-Z0-9_-]/g, '_');
         const fileName = `GameOn_${safeTeam}_${safeOpp}_${date}.pdf`;
 
-        if (typeof html2pdf !== 'undefined') {
-          this.toast('Generating Single Match PDF... 📄');
-          const opt = {
-            margin: [8, 8, 8, 8],
-            filename: fileName,
-            image: { type: 'jpeg', quality: 0.98 },
-            html2canvas: { scale: 2 },
-            jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-          };
-          html2pdf().set(opt).from(container).save().then(() => {
-            container.classList.add('hidden');
-            App.toast('PDF Exported successfully! 📄');
-          }).catch(err => {
-            console.error('PDF error:', err);
-            container.classList.add('hidden');
-            window.print();
-          });
-        } else {
-          window.print();
-          container.classList.add('hidden');
-        }
+        return this.exportPdf(container, fileName);
       },
 
       generateDateRangePdf(startDate = null, endDate = null, teamId = null) {
@@ -3800,7 +3957,7 @@
             const st = playerStats[p.id];
             const isStarter = starters.includes(p.id);
             const pitchSec = timers[p.id] || 0;
-            const hadEvent = events.some(e => e.playerId === p.id || e.playerInId === p.id || e.playerOutId === p.id);
+            const hadEvent = events.some(e => e.playerId === p.id || this.isPlayerSub(e, p, 'In') || this.isPlayerSub(e, p, 'Out'));
 
             if (isStarter || pitchSec > 0 || hadEvent) {
               st.matchesPlayed += 1;
@@ -3809,8 +3966,8 @@
             st.totalSeconds += pitchSec;
             st.goals += events.filter(e => e.type === 'Goal' && e.playerId === p.id).length;
             st.assists += events.filter(e => e.type === 'Assist' && e.playerId === p.id).length;
-            st.subsIn += events.filter(e => e.type === 'Sub' && e.playerInId === p.id).length;
-            st.subsOut += events.filter(e => e.type === 'Sub' && e.playerOutId === p.id).length;
+            st.subsIn += events.filter(e => this.isPlayerSub(e, p, 'In')).length;
+            st.subsOut += events.filter(e => this.isPlayerSub(e, p, 'Out')).length;
           });
         });
 
@@ -3896,8 +4053,7 @@
           : (AppState.currentTeamName || 'GameOn FC');
 
         const dateGen = new Date().toLocaleString();
-        const container = document.getElementById('pdfExportContainer');
-        if (!container) return;
+        const container = document.createElement('div');
 
         container.innerHTML = `
           <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; padding: 24px;">
@@ -3988,41 +4144,23 @@
             <!-- FOOTER -->
             <div style="border-top: 1px solid #e2e8f0; padding-top: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: #94a3b8;">
               <div>Made with GameOn &bull; Tactical Pitch, Live Rotations & Match Intelligence</div>
-              <div>Page 1 of 1 &bull; ${startDate} to ${endDate}</div>
+              <div>${startDate} to ${endDate}</div>
             </div>
           </div>
         `;
 
         this.closeModals();
-        container.classList.remove('hidden');
-
         const safeTeam = String(activeTeamName).replace(/[^a-zA-Z0-9_-]/g, '_');
         const fileName = `GameOn_${safeTeam}_${startDate}_to_${endDate}.pdf`;
 
-        if (typeof html2pdf !== 'undefined') {
-          this.toast('Generating Date Range PDF... 📊');
-          const opt = {
-            margin: [8, 8, 8, 8],
-            filename: fileName,
-            image: { type: 'jpeg', quality: 0.98 },
-            html2canvas: { scale: 2 },
-            jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-          };
-          html2pdf().set(opt).from(container).save().then(() => {
-            container.classList.add('hidden');
-            App.toast('PDF Exported successfully! 📄');
-          }).catch(err => {
-            console.error('PDF error:', err);
-            container.classList.add('hidden');
-            window.print();
-          });
-        } else {
-          window.print();
-          container.classList.add('hidden');
-        }
+        return this.exportPdf(container, fileName);
       },
 
       openExportModal(matchId = null) {
+        this.syncClock();
+        const container = document.getElementById('pdfExportContainer').cloneNode(true);
+        container.removeAttribute('id');
+        container.classList.remove('hidden');
         let targetMatch = AppState.match;
         let targetEvents = AppState.events;
         let targetTimers = AppState.playerTimers;
@@ -4059,15 +4197,17 @@
             if (AppState.events) targetEvents = targetEvents.concat(AppState.events);
           }
 
-          const count = selectedMatches.length + (liveSelected ? 1 : 0);
+          const scoreMatches = liveSelected ? [...selectedMatches, AppState.match] : selectedMatches;
+          const count = scoreMatches.length;
+          if (!count) { this.toast('Please select at least one match.', '⚠️'); return; }
           targetMatch = {
             title: `Pulled Totals (${count} Games)`,
             teamName: AppState.currentTeamName || 'GameOn FC',
             opponent: `${count} Selected Fixtures`,
             date: new Date().toISOString().split('T')[0],
             format: AppState.match.format || '7',
-            ourGoals: targetEvents.filter(e => e.type === 'Goal').length,
-            opponentGoals: 0
+            ourGoals: scoreMatches.reduce((total, m) => total + (m.ourGoals || 0), 0),
+            opponentGoals: scoreMatches.reduce((total, m) => total + (m.opponentGoals || 0), 0)
           };
         } else if (matchId && AppState.matchHistory) {
           const hist = AppState.matchHistory.find(m => m.id === matchId);
@@ -4084,12 +4224,12 @@
         const opp = targetMatch.opponent || 'Opponent';
         const fmt = targetMatch.format || '7';
 
-        document.getElementById('pdfMatchDate').innerText = targetMatch.date || new Date().toISOString().split('T')[0];
-        document.getElementById('pdfGeneratedTime').innerText = 'Generated: ' + new Date().toLocaleString();
-        document.getElementById('pdfFixtureTitle').innerText = `${targetMatch.title || 'Match'} — ${teamName} vs ${opp} (${fmt}v${fmt})`;
-        document.getElementById('pdfMatchResult').innerText = `Score: ${targetMatch.ourGoals || 0} - ${targetMatch.opponentGoals || 0} (Duration: ${this.formatTime(targetDuration)})`;
+        container.querySelector('#pdfMatchDate').innerText = targetMatch.date || new Date().toISOString().split('T')[0];
+        container.querySelector('#pdfGeneratedTime').innerText = 'Generated: ' + new Date().toLocaleString();
+        container.querySelector('#pdfFixtureTitle').innerText = `${targetMatch.title || 'Match'} — ${teamName} vs ${opp} (${fmt}v${fmt})`;
+        container.querySelector('#pdfMatchResult').innerText = `Score: ${targetMatch.ourGoals || 0} - ${targetMatch.opponentGoals || 0} (Duration: ${this.formatTime(targetDuration)})`;
 
-        const tbody = document.getElementById('pdfPlayerTableBody');
+        const tbody = container.querySelector('#pdfPlayerTableBody');
         tbody.innerHTML = '';
         AppState.squad.forEach(p => {
           const sec = targetTimers[p.id] || 0;
@@ -4111,7 +4251,7 @@
           tbody.appendChild(row);
         });
 
-        const log = document.getElementById('pdfTimelineLog');
+        const log = container.querySelector('#pdfTimelineLog');
         log.innerHTML = '';
         if (targetEvents.length === 0) {
           log.innerHTML = `<div class="text-slate-400 italic">No match events recorded during this match session.</div>`;
@@ -4127,31 +4267,8 @@
           });
         }
 
-        const el = document.getElementById('pdfExportContainer');
-        el.classList.remove('hidden');
-
-        if (typeof html2pdf !== 'undefined') {
-          this.toast('Generating PDF document...');
-          const filenameSafe = (targetMatch.title || 'Match').replace(/\s+/g, '_');
-          const opt = {
-            margin: 10,
-            filename: `GameOn_${filenameSafe}_${targetMatch.date || 'report'}.pdf`,
-            image: { type: 'jpeg', quality: 0.98 },
-            html2canvas: { scale: 2 },
-            jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-          };
-          html2pdf().set(opt).from(el).save().then(() => {
-            el.classList.add('hidden');
-            App.toast('PDF Exported successfully! 📄');
-          }).catch(err => {
-            console.error('PDF error:', err);
-            el.classList.add('hidden');
-            window.print();
-          });
-        } else {
-          window.print();
-          el.classList.add('hidden');
-        }
+        const filenameSafe = String(targetMatch.title || 'Match').replace(/[^a-zA-Z0-9_-]/g, '_');
+        return this.exportPdf(container, `GameOn_${filenameSafe}_${targetMatch.date || 'report'}.pdf`);
       },
 
       openMatchSetupModal() {
@@ -4297,6 +4414,8 @@
       },
 
       renderAll() {
+        this.syncClock();
+        this.renderPeriodDisplay();
         const teamName = AppState.match.teamName || AppState.currentTeamName || 'GameOn FC';
         const opp = AppState.match.opponent || 'Echo Strikers';
         const fmt = AppState.match.format || '7';
